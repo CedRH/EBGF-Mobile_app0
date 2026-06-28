@@ -1,0 +1,397 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import '../models/farm_record.dart';
+
+/// Live camera + on-device text recognition screen.
+///
+/// HOW THIS MEETS YOUR REQUIREMENT:
+/// - Uses the device camera in a live preview (no photo file is ever saved
+///   to disk), so there's no extra storage used per scan.
+/// - Each camera frame is run through Google ML Kit's on-device text
+///   recognizer. Recognized text is shown live, like a live caption.
+/// - When text is detected, the user taps "Use this text" to lock it in,
+///   edit it if needed, then continues to fill in 3 more fields.
+/// - Before saving, the user sees everything (tag number + 3 fields) on a
+///   confirmation screen. Only after they confirm does it become a
+///   FarmRecord that gets handed back to be saved to the database.
+///
+/// SETUP NOTE: ML Kit Text Recognition runs fully on-device — no internet
+/// call, no per-scan cost, and nothing is uploaded. You'll need to add the
+/// `camera` and `google_mlkit_text_recognition` packages (see pubspec.yaml
+/// in the setup guide) and grant camera permission on the device.
+class ScanScreen extends StatefulWidget {
+  final String createdBy;
+
+  const ScanScreen({super.key, required this.createdBy});
+
+  @override
+  State<ScanScreen> createState() => _ScanScreenState();
+}
+
+class _ScanScreenState extends State<ScanScreen> {
+  CameraController? _cameraController;
+  final TextRecognizer _textRecognizer = TextRecognizer();
+
+  bool _isCameraReady = false;
+  bool _isProcessingFrame = false;
+  bool _isStreaming = true;
+  String _liveDetectedText = '';
+  DateTime _lastProcessed = DateTime.now();
+
+  @override
+  void initState() {
+    super.initState();
+    _initCamera();
+  }
+
+  Future<void> _initCamera() async {
+    try {
+      final cameras = await availableCameras();
+      final backCamera = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+
+      final controller = CameraController(
+        backCamera,
+        ResolutionPreset
+            .medium, // medium is plenty for text and keeps frames light
+        enableAudio: false,
+      );
+
+      await controller.initialize();
+      if (!mounted) return;
+
+      setState(() {
+        _cameraController = controller;
+        _isCameraReady = true;
+      });
+
+      controller.startImageStream(_processCameraFrame);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Camera error: $e')),
+      );
+    }
+  }
+
+  Future<void> _processCameraFrame(CameraImage image) async {
+    // Throttle so we are not running OCR on every single frame
+    // (saves battery/CPU); roughly 2-3 times per second is plenty.
+    final now = DateTime.now();
+    if (_isProcessingFrame || !_isStreaming) return;
+    if (now.difference(_lastProcessed) < const Duration(milliseconds: 400)) {
+      return;
+    }
+    _lastProcessed = now;
+    _isProcessingFrame = true;
+
+    try {
+      final inputImage = _convertToInputImage(image);
+      if (inputImage != null) {
+        final result = await _textRecognizer.processImage(inputImage);
+        if (mounted) {
+          setState(() => _liveDetectedText = result.text.trim());
+        }
+      }
+    } catch (_) {
+      // Silently ignore occasional frame conversion issues; next frame retries.
+    } finally {
+      _isProcessingFrame = false;
+    }
+  }
+
+  InputImage? _convertToInputImage(CameraImage image) {
+    final camera = _cameraController?.description;
+    if (camera == null) return null;
+
+    final rotation =
+        InputImageRotationValue.fromRawValue(camera.sensorOrientation) ??
+            InputImageRotation.rotation0deg;
+
+    final format = InputImageFormatValue.fromRawValue(image.format.raw) ??
+        InputImageFormat.nv21;
+
+    final plane = image.planes.first;
+
+    return InputImage.fromBytes(
+      bytes: plane.bytes,
+      metadata: InputImageMetadata(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        rotation: rotation,
+        format: format,
+        bytesPerRow: plane.bytesPerRow,
+      ),
+    );
+  }
+
+  void _useDetectedText() {
+    setState(() => _isStreaming = false);
+    _cameraController?.stopImageStream();
+
+    Navigator.of(context)
+        .push(
+      MaterialPageRoute(
+        builder: (_) => _RecordDetailsScreen(
+          initialTagNumber: _liveDetectedText,
+          createdBy: widget.createdBy,
+        ),
+      ),
+    )
+        .then((result) {
+      if (result != null && mounted) {
+        Navigator.of(context).pop(result); // pass the saved record back to Home
+      } else {
+        // user backed out of details screen — resume scanning
+        setState(() => _isStreaming = true);
+        _cameraController?.startImageStream(_processCameraFrame);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _cameraController?.dispose();
+    _textRecognizer.close();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        title: const Text('Scan Tag / Label'),
+        backgroundColor: Colors.black,
+      ),
+      body: !_isCameraReady
+          ? const Center(
+              child: CircularProgressIndicator(color: Colors.white),
+            )
+          : Stack(
+              children: [
+                Positioned.fill(child: CameraPreview(_cameraController!)),
+                // Dim overlay with a focus box, just to guide the user's aim
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: Center(
+                      child: Container(
+                        width: 280,
+                        height: 120,
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                              color: const Color.fromARGB(186, 102, 18, 15),
+                              width: 2),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(20, 20, 20, 28),
+                    decoration: const BoxDecoration(
+                      color: Colors.black87,
+                      borderRadius:
+                          BorderRadius.vertical(top: Radius.circular(20)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          'Detected text:',
+                          style: TextStyle(color: Colors.white70, fontSize: 12),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          _liveDetectedText.isEmpty
+                              ? 'Point the camera at the tag or label...'
+                              : _liveDetectedText,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                        ElevatedButton.icon(
+                          onPressed: _liveDetectedText.isEmpty
+                              ? null
+                              : _useDetectedText,
+                          icon: const Icon(Icons.check),
+                          label: const Text('Use this text'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+    );
+  }
+}
+
+/// Step 2: collect the 3 required fields + show a confirmation before saving.
+class _RecordDetailsScreen extends StatefulWidget {
+  final String initialTagNumber;
+  final String createdBy;
+
+  const _RecordDetailsScreen({
+    required this.initialTagNumber,
+    required this.createdBy,
+  });
+
+  @override
+  State<_RecordDetailsScreen> createState() => _RecordDetailsScreenState();
+}
+
+class _RecordDetailsScreenState extends State<_RecordDetailsScreen> {
+  late final TextEditingController _tagController =
+      TextEditingController(text: widget.initialTagNumber);
+  final _fieldOneController = TextEditingController();
+  final _fieldTwoController = TextEditingController();
+  final _fieldThreeController = TextEditingController();
+  final _formKey = GlobalKey<FormState>();
+
+  @override
+  void dispose() {
+    _tagController.dispose();
+    _fieldOneController.dispose();
+    _fieldTwoController.dispose();
+    _fieldThreeController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _showConfirmationAndSave() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Confirm Record'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _ConfirmRow(label: 'Tag / Scanned No.', value: _tagController.text),
+            _ConfirmRow(label: 'Field 1', value: _fieldOneController.text),
+            _ConfirmRow(label: 'Field 2', value: _fieldTwoController.text),
+            _ConfirmRow(label: 'Field 3', value: _fieldThreeController.text),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Edit'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Confirm & Save'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      final record = FarmRecord(
+        id: DateTime.now().microsecondsSinceEpoch.toString(),
+        tagNumber: _tagController.text.trim(),
+        fieldOne: _fieldOneController.text.trim(),
+        fieldTwo: _fieldTwoController.text.trim(),
+        fieldThree: _fieldThreeController.text.trim(),
+        createdBy: widget.createdBy,
+        createdAt: DateTime.now(),
+      );
+      // TODO: This is where you call your database write, e.g.:
+      // await FirebaseFirestore.instance.collection('records').doc(record.id).set(record.toMap());
+      Navigator.of(context)
+          .pop(record); // returns record to ScanScreen -> HomeScreen
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('New Record')),
+      body: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Form(
+          key: _formKey,
+          child: ListView(
+            children: [
+              TextFormField(
+                controller: _tagController,
+                decoration: const InputDecoration(
+                  labelText: 'Tag / Scanned Number',
+                  prefixIcon: Icon(Icons.qr_code),
+                ),
+                validator: (v) =>
+                    (v == null || v.trim().isEmpty) ? 'Required' : null,
+              ),
+              const SizedBox(height: 14),
+              TextFormField(
+                controller: _fieldOneController,
+                decoration:
+                    const InputDecoration(labelText: 'Field 1 (e.g. Name)'),
+                validator: (v) =>
+                    (v == null || v.trim().isEmpty) ? 'Required' : null,
+              ),
+              const SizedBox(height: 14),
+              TextFormField(
+                controller: _fieldTwoController,
+                decoration:
+                    const InputDecoration(labelText: 'Field 2 (e.g. Weight)'),
+                validator: (v) =>
+                    (v == null || v.trim().isEmpty) ? 'Required' : null,
+              ),
+              const SizedBox(height: 14),
+              TextFormField(
+                controller: _fieldThreeController,
+                decoration:
+                    const InputDecoration(labelText: 'Field 3 (e.g. Notes)'),
+                validator: (v) =>
+                    (v == null || v.trim().isEmpty) ? 'Required' : null,
+              ),
+              const SizedBox(height: 28),
+              ElevatedButton(
+                onPressed: _showConfirmationAndSave,
+                child: const Text('Review & Save'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ConfirmRow extends StatelessWidget {
+  final String label;
+  final String value;
+  const _ConfirmRow({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: RichText(
+        text: TextSpan(
+          style: const TextStyle(color: Colors.black87, fontSize: 14),
+          children: [
+            TextSpan(
+                text: '$label: ',
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+            TextSpan(text: value.isEmpty ? '(empty)' : value),
+          ],
+        ),
+      ),
+    );
+  }
+}
